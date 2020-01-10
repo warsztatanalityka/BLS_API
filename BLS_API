@@ -1,0 +1,198 @@
+import json
+import datetime
+from sqlalchemy import create_engine
+import urllib
+import requests
+import pandas as pd
+
+
+class BlsData:
+
+    def __init__(self, start_end_y, end_y, data_down_list, name_list, db_name, freq):
+        self.start_y = start_end_y
+        self.end_y = end_y
+        self.data_down_list = data_down_list
+        self.name = name_list
+        self.db_name = db_name
+        self.freq = freq
+
+    def download_new(self):
+        json_data = self.return_json()
+        if self.is_date_valid(json_data) is None:
+            return None
+        bls_df = self.concat_json(json_data)
+        df_date = self.create_date(bls_df)
+        return df_date
+
+    def insert_new_sql(self):
+        df_date = self.download_new()
+        SqlMethods.bls_df_to_sql(self.db_name, df_date)
+
+    def update_null(self, null_date):
+        self.update_release_func(null_date)
+        downloaded_df = self.download_new()
+        if downloaded_df is None:
+            return None
+        df_date = self.adj_data_before_insert(downloaded_df, null_date)
+        SqlMethods.bls_df_to_sql(self.db_name, df_date)
+
+    def update_new(self, max_date_update):
+        # https://www.bls.gov/schedule/2018/home.htm
+        # update schedule for new year, before try to update
+        self.update_release_func(max_date_update)
+        downloaded_df = self.download_new()
+        if downloaded_df is None:
+            return None
+        df_date = self.adj_data_before_insert(downloaded_df, max_date_update)
+        SqlMethods.bls_df_to_sql(self.db_name, df_date)
+
+    @staticmethod
+    def adj_data_before_insert(df_to_adjust, date):
+        reduced_df_t_f = df_to_adjust['date'] >= pd.Timestamp(date)
+        reduced_df = df_to_adjust.where(reduced_df_t_f).dropna(how='all')
+        return reduced_df
+
+    def update_release_func(self, max_date_update):
+        # User always want recent data, so self.end_y is set to current date
+        # After that we need to adjust date, because we will have an error
+        # when we set update before data from next year are updated
+        # sample: today is 1/01/2020 and we set end_y for 2020, it will give us an error
+        # we cant use parameter since in BLS and we need to waite for first update which will
+        # occur in half of January forward
+        now = datetime.datetime.now()
+        self.start_y = max_date_update.year
+        self.end_y = now.year
+        if self.freq == 'M':
+            if now < datetime.datetime(now.year, 1, 15):
+                self.end_y = now.year - 1
+                self.start_y = max_date_update.year
+        if self.freq == 'Q':
+            if now < datetime.datetime(now.year, 4, 15):
+                self.end_y = now.year - 1
+                self.start_y = max_date_update.year
+        if self.freq == 'Y':
+            if now < datetime.datetime(now.year, 2, 15):
+                self.end_y = now.year - 1
+                self.start_y = max_date_update.year
+
+    def return_json(self):
+        dict_args = {"seriesid": self.data_down_list, "startyear": self.start_y, "endyear": self.end_y, "registrationkey": "badac4e47a2c4d10b920ed7a2bfacf38"}
+        headers = {'Content-type': 'application/json'}
+        data = json.dumps(dict_args)
+        p = requests.post('https://api.bls.gov/publicAPI/v2/timeseries/data/', data=data, headers=headers)
+        json_data = json.loads(p.text)
+        return json_data
+
+    @staticmethod
+    # https://www.bls.gov/developers/api_faqs.htm#errors3
+    def is_date_valid(json_data):
+        if len(json_data['message']) == 0:
+            print('Correct query, proceed... ')
+            return True
+        else:
+            for how_many, item in enumerate(range(len(json_data['message']))):
+                print(f'''Error was found, specifics:  {json_data['message'][how_many]} ''')
+            print('Check your query')
+            print('Function has been terminated')
+            return None
+
+    def concat_json(self, json_data):
+        df_list = []
+        for item in json_data['Results']['series']:
+            df_json = pd.DataFrame.from_dict(item['data'])
+            df_list.append(df_json)
+        # save year + month
+        df_bls = df_list[0][['period','year']]
+        for counter, data_frame in enumerate(df_list):
+            df_list[counter] = df_list[counter]['value']
+            df_list[counter] = df_list[counter].rename(self.name[counter])
+            df_bls = pd.concat([df_bls, df_list[counter]], axis=1)
+        return df_bls
+
+    def clear_nulls(self):
+        # Sort data frame to avoid problems with taking first value from pandas data frame
+        # Does not matter is it null or no, we need to delete data in both cases
+        # If you would like to specify a time frame in your request, you must include a startyear and an endyear within the request.
+        df = SqlMethods.query_sql(f'select * from (select top 5* from {self.db_name} order by date desc) as t5 order by date asc')
+        find_nulls = df.iloc[:, 1:].isnull()
+        merge_t_f = pd.Series.any(find_nulls, axis=1)
+        display_true_only = df['date'].where(merge_t_f).dropna(how='all')
+        if display_true_only.size == 0:
+            print(f'There is no nulls in {self.db_name}.')
+            return True
+        else:
+            del_data_from = display_true_only.iloc[0]
+            SqlMethods.return_engine().execute(
+                f'''delete from {self.db_name} where date >= '{del_data_from}' ''')
+            return del_data_from
+
+    def update_new_or_null(self):
+        up_n_null = self.clear_nulls()
+        if up_n_null is True:
+            max_date = SqlMethods.query_sql(f'select max(date) from {self.db_name}')
+            SqlMethods.return_engine().execute(
+                f'''delete from {self.db_name} where date >= '{max_date.iloc[0, 0]}' ''')
+            return self.update_new(max_date.iloc[0, 0])
+        else:
+            return self.update_null(up_n_null)
+
+    def create_date(self, df):
+        if self.freq == 'M':
+            replacement = {'M': '-'}
+            df['year'] = df['year'].astype('str')
+            df['date'] = df['year'] + df['period']
+            df['date'].replace(replacement, regex=True, inplace=True)
+            df['date'] = pd.to_datetime(df['date'], format='%Y/%m/%d')
+            df_date_m = df[['date'] + self.name]
+            df_date_m = df_date_m.sort_values(by='date')
+            return df_date_m
+        # https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.Period.to_timestamp.html
+        # https://pandas.pydata.org/pandas-docs/version/0.12/timeseries.html
+        if self.freq == 'Q':
+            replacement = {'Q01': '-03', 'Q02': '-06', 'Q03': '-09', 'Q04': '-12'}
+            df['year'] = df['year'].astype('str')
+            df['date'] = df['year'] + df['period']
+            df['date'].replace(replacement, regex=True, inplace=True)
+            df['date'] = pd.to_datetime(df['date'], format='%Y/%m/%d')
+            df_date_q = df[['date'] + self.name]
+            df_date_q = df_date_q.sort_values(by='date')
+            return df_date_q
+        if self.freq == 'Y':
+            pass
+
+
+class SqlMethods:
+    @staticmethod
+    # https://docs.sqlalchemy.org/en/13/dialects/mssql.html
+    # Pass through exact Pyodbc string
+    def return_engine():
+        params = urllib.parse.quote_plus(
+            r'DRIVER={SQL Server Native Client 11.0};SERVER=DESKTOP-LP663G5\SQL2019TRAINING;DATABASE=Finance;Trusted_Connection=yes')
+        conn_str = f'mssql+pyodbc:///?odbc_connect={params}'
+        engine = create_engine(conn_str)
+        return engine
+
+    @staticmethod
+    def query_sql(query_sql):
+        data = pd.read_sql_query(sql=query_sql, con=SqlMethods.return_engine())
+        return data
+
+    @staticmethod
+    def bls_df_to_sql(db_name, bls_df):
+         bls_df.to_sql( name=db_name,
+                        con=SqlMethods.return_engine(),
+                        index=False,
+                        if_exists='append')
+         print(f'Your data has been added, from {bls_df.iloc[0, 0]} to {bls_df.iloc[-1, 0]} to your database: {db_name}')
+
+
+monthly = BlsData(2013, 2019, ['CUUR0000SA0', 'SUUR0000SA0', 'PCU327320327320', 'LNS14000000'],
+                  ['Bezrobocie_USA', 'Zatrudnienie_USA','PPI_Industry_Data','Unemployment_Rate'], 'm_bls', 'M')
+quarterly = BlsData(2013, 2019, ['PRS85006092', 'PRS85006112', 'PRS85006152'],
+                    ['Labor_productivity_h', 'Unit_labor_costs','Real_hourly_compensation'], 'q_bls', 'Q')
+
+
+quarterly.insert_new_sql()
+monthly.insert_new_sql()
+monthly.update_new_or_null()
+quarterly.update_new_or_null()
