@@ -5,6 +5,9 @@ import urllib
 import requests
 import pandas as pd
 
+# download from API BLS
+# update/insert data into local database
+
 
 class BlsData:
 
